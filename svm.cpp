@@ -12,7 +12,7 @@
  *
  * @author Junru Shen
  */
-#define SVM true
+#define MAGIC "80JF34R9S "
 #define MAX_INSTRUCTION_NUM 1000000
 #define MAX_INSTRUCTION_ADDR 2000000
 #define MEM_DBG
@@ -20,7 +20,6 @@
 #define OP_POP() (*operands)[(*op_top_ptr)--]
 #define OP_TOP() (*operands)[*op_top_ptr]
 #define OP_PUSH(slot) (*operands)[++(*op_top_ptr)] = slot
-#define RELEASE(slot) delete slot
 #ifdef MEM_DBG
 #define SLOT_INCREF(slot, reason)                                       \
     do {                                                                \
@@ -56,6 +55,22 @@
     }                                                                   \
   } while (0)
 #endif
+
+#define RELEASE(slot) \
+do { \
+    if (slot->type == ARRAY) { \
+        for (int i = 0; i < slot->array_size; i++) { \
+            slot->array_val[i]->ref_cnt--; \
+            if (!slot->array_val[i]->ref_cnt) { \
+                delete slot->array_val[i]; \
+                slot->array_val[i] = nullptr; \
+            } \
+        } \
+    } \
+    delete slot; \
+    slot = nullptr; \
+} while (0)
+
 #define DISPATCH goto dispatch
 #define FULL_DISPATCH goto full_dispatch
 #if __WORDSIZE == 64
@@ -81,6 +96,7 @@ enum instruct_code {
     CONSTANT,
     NOOP,
     POP_OP,
+    TYPE_CVT,
     // Load const and name
     LOAD_NULL,
     LOAD_CONSTANT,
@@ -99,6 +115,7 @@ enum instruct_code {
     STORE_NAME_GLOBAL_NOPOP,
     // Build array
     BUILD_ARR,
+    SIZE_OF,
     // Operators
     BINARY_OP,
     UNARY_OP,
@@ -115,7 +132,10 @@ enum instruct_code {
     // Halt
     HALT,
     // Debugging
-    PRINTK
+    PRINTK,
+    // Basic I/O
+    PUTCH,
+    GETCH
 };
 
 // Basic data types
@@ -130,21 +150,21 @@ enum basic_data_types {
 // Slot
 struct slot {
     basic_data_types type = VOID;
-    int_tp int_val;
-    float_tp float_val;
-    char_tp char_val;
-    slot **array_val;
-    int array_size;
+    int_tp int_val{};
+    float_tp float_val{};
+    char_tp char_val{};
+    slot **array_val{};
+    int array_size{};
     basic_data_types arr_element_type = VOID;
     int ref_cnt = 1;
 
-    slot(int_tp _int_val) : int_val(_int_val), type(INT) {}
+    explicit slot(int_tp _int_val) : int_val(_int_val), type(INT) {}
 
-    slot(bool bool_val) : int_val(bool_val ? 1 : 0), type(INT) {}
+    explicit slot(bool bool_val) : int_val(bool_val ? 1 : 0), type(INT) {}
 
-    slot(float_tp _float_val) : float_val(_float_val), type(FLOAT) {}
+    explicit slot(float_tp _float_val) : float_val(_float_val), type(FLOAT) {}
 
-    slot(char_tp _char_val) : char_val(_char_val), type(CHAR) {}
+    explicit slot(char_tp _char_val) : char_val(_char_val), type(CHAR) {}
 
     slot(int _array_size, basic_data_types _type) {
         if (_type == ARRAY || _type == VOID) {
@@ -155,7 +175,7 @@ struct slot {
         array_size = _array_size;
         array_val = new slot *[array_size];
         for (int i = 0; i < array_size; i++) {
-            slot *fill_slot;
+            slot *fill_slot = nullptr;
             switch (_type) {
                 case INT:
                     fill_slot = new slot((int_tp) 0);
@@ -175,7 +195,7 @@ struct slot {
         }
     }
 
-    slot() {}
+    slot() = default;
 
     std::string as_string() {
         std::stringstream res;
@@ -242,13 +262,13 @@ T_OPSTACK global_operands;
 // Virtual Machine
 class Machine {
 private:
-    int ins_cnt;
-    frame *esp;
+    int ins_cnt{};
+    frame *esp{};
     int op_top;
-    int ip;
+    int ip{};
     bool verbose = false;
-    T_OPSTACK *operands;
-    int *op_top_ptr;
+    T_OPSTACK *operands{};
+    int *op_top_ptr{};
 
 public:
     static std::unordered_map<std::string, instruct_code> string_inscode_mapping;
@@ -283,11 +303,15 @@ public:
         string_inscode_mapping["LOAD_GLOBAL"] = LOAD_GLOBAL;
         string_inscode_mapping["STORE_GLOBAL"] = STORE_GLOBAL;
         string_inscode_mapping["BUILD_ARR"] = BUILD_ARR;
+        string_inscode_mapping["TYPE_CVT"] = TYPE_CVT;
         string_inscode_mapping["BINARY_SUBSCR"] = BINARY_SUBSCR;
         string_inscode_mapping["STORE_SUBSCR"] = STORE_SUBSCR;
         string_inscode_mapping["STORE_SUBSCR_INPLACE"] = STORE_SUBSCR_INPLACE;
         string_inscode_mapping["STORE_SUBSCR_NOPOP"] = STORE_SUBSCR_NOPOP;
         string_inscode_mapping["PRINTK"] = PRINTK;
+        string_inscode_mapping["PUTCH"] = PUTCH;
+        string_inscode_mapping["GETCH"] = GETCH;
+        string_inscode_mapping["SIZE_OF"] = SIZE_OF;
     }
 
     static void load_param_mapping() {
@@ -318,14 +342,21 @@ public:
         inscode_param_cnt_mapping[LOAD_GLOBAL] = 0;
         inscode_param_cnt_mapping[STORE_GLOBAL] = 0;
         inscode_param_cnt_mapping[BUILD_ARR] = 1;
+        inscode_param_cnt_mapping[TYPE_CVT] = 1;
         inscode_param_cnt_mapping[BINARY_SUBSCR] = 0;
         inscode_param_cnt_mapping[STORE_SUBSCR] = 0;
         inscode_param_cnt_mapping[STORE_SUBSCR_INPLACE] = 0;
         inscode_param_cnt_mapping[STORE_SUBSCR_NOPOP] = 0;
         inscode_param_cnt_mapping[PRINTK] = 0;
+        inscode_param_cnt_mapping[PUTCH] = 0;
+        inscode_param_cnt_mapping[GETCH] = 0;
+        inscode_param_cnt_mapping[SIZE_OF] = 0;
+        // only used for assemble/disassemble
+        inscode_param_cnt_mapping[CONSTANT] = 3;
     }
 
     Machine() {
+        op_top = -1;
         reset();
     }
 
@@ -340,7 +371,9 @@ public:
     void reset() {
         ip = -1;
         ins_cnt = 0;
-        op_top = -1;
+        while (op_top > -1) {
+            RELEASE(global_operands[op_top--]);
+        }
         esp = nullptr;
         while (var_cnt--) {
             RELEASE(globals[var_cnt]);
@@ -389,14 +422,16 @@ public:
                 }
                 switch (ins.code) {
                     case VMALLOC: {
-                        if (esp == nullptr) {
-                            globals = new slot *[ins.operand];
-                            for (int i = 0; i < ins.operand; i++) globals[i] = nullptr;
-                            var_cnt = ins.operand;
-                        } else {
-                            esp->locals = new slot *[ins.operand];
-                            for (int i = 0; i < ins.operand; i++) esp->locals[i] = nullptr;
-                            esp->var_cnt = ins.operand;
+                        if (ins.operand) {
+                            if (esp == nullptr) {
+                                globals = new slot *[ins.operand];
+                                for (int i = 0; i < ins.operand; i++) globals[i] = nullptr;
+                                var_cnt = ins.operand;
+                            } else {
+                                esp->locals = new slot *[ins.operand];
+                                for (int i = 0; i < ins.operand; i++) esp->locals[i] = nullptr;
+                                esp->var_cnt = ins.operand;
+                            }
                         }
                         DISPATCH;
                     }
@@ -407,6 +442,36 @@ public:
                     case POP_OP: {
                         slot *op = OP_POP();
                         SLOT_DECREF(op, "Operand is poped from the stack");
+                        DISPATCH;
+                    }
+
+                    case TYPE_CVT: {
+                        slot *op = OP_POP();
+                        slot *res = nullptr;
+                        switch (ins.operand) {
+                            // INT
+                            case 0:
+                                if (op->type == INT) {
+                                    res = new slot((int_tp) op->int_val);
+                                } else if (op->type == FLOAT) {
+                                    res = new slot((int_tp) op->float_val);
+                                }
+                                break;
+                            // FLOAT
+                            case 1:
+                                if (op->type == INT) {
+                                    res = new slot((float_tp) op->int_val);
+                                } else if (op->type == FLOAT) {
+                                    res = new slot((float_tp) op->float_val);
+                                }
+                                break;
+                            // CHAR
+                            case 2:
+                                res = new slot((char_tp) op->char_val);
+                                break;
+                        }
+                        OP_PUSH(res);
+                        SLOT_DECREF(op, "Convert type");
                         DISPATCH;
                     }
 
@@ -445,13 +510,16 @@ public:
                                       << (to_ip < ins_cnt - 1 ? instructs[to_ip + 1].address : -1)
                                       << " with return value " << ret->as_string() << "." << std::endl;
                         }
-                        while (esp->op_top--) {
+                        while (esp->op_top > -1) {
                             SLOT_DECREF(esp->local_operands[esp->op_top], "Return statement op decref");
                         }
                         while (esp->var_cnt--) {
                             SLOT_DECREF(esp->locals[esp->var_cnt], "Return statement var decref");
                         }
-                        esp = esp->caller;
+                        delete esp->locals;
+                        frame *tmp = esp->caller;
+                        delete esp;
+                        esp = tmp;
                         FULL_DISPATCH;
                     }
 
@@ -479,6 +547,16 @@ public:
                         if (verbose) {
                             std::cout << "Float value " << ins.operand << " was loaded to operand stack." << std::endl;
                         }
+                        DISPATCH;
+                    }
+
+                    case SIZE_OF: {
+                        slot *element = OP_POP();
+                        SLOT_DECREF(element, "Size of calculate");
+                        int size;
+                        if (element->type != ARRAY) size = 1;
+                        else size = element->array_size;
+                        OP_PUSH(new slot((int_tp) size));
                         DISPATCH;
                     }
 
@@ -531,6 +609,7 @@ public:
                         } else {
                             esp->locals[ins.operand] = OP_TOP();
                         }
+                        SLOT_INCREF(esp->locals[ins.operand], "STORE_NAME[_NOPOP]");
                         if (verbose) {
                             std::cout << "Stored " << esp->locals[ins.operand]->as_string() << " to name " << ins.operand << " in locals."
                                       << std::endl;
@@ -831,7 +910,19 @@ public:
                         goto finish;
                     }
                     case PRINTK: {
-                        std::cout << OP_POP()->as_string() << std::endl;
+                        slot *slot = OP_POP();
+                        std::cout << slot->as_string() << std::endl;
+                        SLOT_DECREF(slot, "Printk");
+                        DISPATCH;
+                    }
+                    case PUTCH: {
+                        slot *slot = OP_POP();
+                        SLOT_DECREF(slot, "Putch");
+                        std::cout << slot->char_val;
+                        DISPATCH;
+                    }
+                    case GETCH: {
+                        OP_PUSH(new slot((char_tp) getchar()));
                         DISPATCH;
                     }
                     case STORE_GLOBAL: {
@@ -945,7 +1036,7 @@ void interpret(std::istream &is, bool verbose, bool in_interact) {
     while (is >> addr) {
         if (in_interact && addr == -1) {
             machine.dispatch();
-            continue;
+            break;
         }
         instruct_code ins;
         if (in_interact) {
@@ -964,21 +1055,21 @@ void interpret(std::istream &is, bool verbose, bool in_interact) {
                 // int
                 case 0: {
                     int_tp tmp;
-                    std::cin >> tmp;
+                    is >> tmp;
                     constants[addr] = new slot(tmp);
                     break;
                 }
                     // float
                 case 1: {
                     float_tp tmp;
-                    std::cin >> tmp;
+                    is >> tmp;
                     constants[addr] = new slot(tmp);
                     break;
                 }
                     // char
                 case 2: {
                     int tmp;
-                    std::cin >> tmp;
+                    is >> tmp;
                     constants[addr] = new slot((char_tp) tmp);
                     break;
                 }
@@ -987,7 +1078,7 @@ void interpret(std::istream &is, bool verbose, bool in_interact) {
             continue;
         } else if (ins == CMALLOC) {
             is >> constant_cnt;
-            constants = new slot*[constant_cnt];
+            if (constant_cnt) constants = new slot*[constant_cnt];
             continue;
         }
         int param_number = Machine::inscode_param_cnt_mapping[ins];
@@ -1006,49 +1097,49 @@ void interact(bool verbose) {
     interpret(std::cin, verbose, true);
 };
 
-void assemble(std::string raw_file_path, std::string out_file_path, std::string password) {
+void assemble(const std::string& raw_file_path, const std::string& out_file_path, std::string password) {
     std::ifstream raw_file(raw_file_path, std::ios::in);
     std::ofstream out_file(out_file_path, std::ios::out | std::ios::trunc);
 
+    std::cout << "<<<<* SLang Virtual Machine Assembler *>>>>" << std::endl;
     std::stringstream buf;
     int addr;
-    buf << "80JF34R9S ";
+    buf << MAGIC;
     while (raw_file >> addr) {
         std::string ins_str;
         raw_file >> ins_str;
+        std::cout << ":Generating " << ins_str << " at " << addr << "..." << std::endl;
         instruct_code ins = Machine::string_inscode_mapping[ins_str];
         int param_number = Machine::inscode_param_cnt_mapping[ins];
         buf << addr << " " << ins << " ";
-        if (param_number) {
-            int param;
+        while (param_number--) {
+            std::string param;
             raw_file >> param;
             buf << param << " ";
         }
     }
 
     std::string s = buf.str();
+    password = MAGIC + password;
     int len = password.length();
-    if (len) {
-        for (int i = 0; i < s.length(); i++) s[i] ^= password[i % len];
-    }
+    std::cout << ":Encrypting bytecode..." << std::endl;
+    for (int i = 0; i < s.length(); i++) s[i] ^= password[i % len];
     out_file << s;
 
     raw_file.close();
     out_file.close();
 }
 
-void run(std::string input_file_path, bool verbose, std::string password) {
+void run(const std::string& input_file_path, bool verbose, std::string password) {
     std::ifstream input_file(input_file_path, std::ios::in);
     std::string content((std::istreambuf_iterator<char>(input_file)),
                         (std::istreambuf_iterator<char>()));
+    password = MAGIC + password;
     int len = password.length();
-    if (len) {
-        for (int i = 0; i < content.length(); i++) content[i] ^= password[i % len];
-    }
+    for (int i = 0; i < content.length(); i++) content[i] ^= password[i % len];
     std::stringstream ss(content);
     std::string hd;
     ss >> hd;
-    if (hd != "80JF34R9S") return;
     interpret(ss, verbose, false);
 };
 
@@ -1077,7 +1168,7 @@ void disassemble(std::string input_file_path, std::string password) {
         ins = instruct_code(ins_tmp);
         std::cout << code_name_mapping[ins] << " ";
         int param_number = Machine::inscode_param_cnt_mapping[ins];
-        if (param_number) {
+        while (param_number) {
             int param;
             ss >> param;
             std::cout << param << " ";
