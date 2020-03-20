@@ -5,9 +5,9 @@
  *
  * Usage:
  * $ g++ svm.cpp -o svm
- * $ svm -r ./helloworld.slb (-v) (-p password) -- Run program (-v: in verbose mode)
+ * $ svm -r (-e) ./helloworld.slb (-v) (-p password) -- Run program (-v: in verbose mode, -e: performance evaluator)
  * $ svm -d ./helloworld.slb (-p password) -- Disassembly
- * $ svm -i (-v) -- Interact Mode (-v: in verbose mode)
+ * $ svm -i (-v) (-e) -- Interact Mode (-v: in verbose mode, -e: performance evaluator)
  * $ svm -a ./helloworld.txt -o ./helloworld.slb (-p password) -- Assembly input file
  *
  * @author Junru Shen
@@ -49,6 +49,7 @@
 #else
 #define SLOT_DECREF(slot, reason)                                       \
   do {                                                                  \
+    if (slot == nullptr) break;                                         \
     slot->ref_cnt--;                                                    \
     if (!slot->ref_cnt) {                                               \
         RELEASE(slot);                                                  \
@@ -58,10 +59,12 @@
 
 #define RELEASE(slot) \
 do { \
+    if (slot == nullptr) break; \
     if (slot->type == ARRAY) { \
         for (int i = 0; i < slot->array_size; i++) { \
             slot->array_val[i]->ref_cnt--; \
             if (!slot->array_val[i]->ref_cnt) { \
+                if (slot->array_val[i] == nullptr) continue; \
                 delete slot->array_val[i]; \
                 slot->array_val[i] = nullptr; \
             } \
@@ -88,6 +91,15 @@ typedef char char_tp;
 #include <sstream>
 #include <unordered_map>
 #include <getopt.h>
+#include <ctime>
+#include <iomanip>
+
+void panic(const std::string& msg) {
+    std::cout << "Runtime error: " << msg << std::endl;
+    std::cout << "Enter verbose mode to see details." << std::endl;
+    std::cout << "ABORTING..." << std::endl;
+    abort();
+}
 
 // Instruction codes
 enum instruct_code {
@@ -155,7 +167,6 @@ struct slot {
     char_tp char_val{};
     slot **array_val{};
     int array_size{};
-    basic_data_types arr_element_type = VOID;
     int ref_cnt = 1;
 
     explicit slot(int_tp _int_val) : int_val(_int_val), type(INT) {}
@@ -179,15 +190,15 @@ struct slot {
             switch (_type) {
                 case INT:
                     fill_slot = new slot((int_tp) 0);
-                    arr_element_type = INT;
                     break;
                 case FLOAT:
                     fill_slot = new slot((float_tp) 0.0);
-                    arr_element_type = FLOAT;
                     break;
                 case CHAR:
                     fill_slot = new slot((char) '\0');
-                    arr_element_type = CHAR;
+                    break;
+                default:
+                    panic("Unsupported type here");
                     break;
             }
             *(array_val + i) = fill_slot;
@@ -224,31 +235,30 @@ struct slot {
 
 typedef slot *T_OPSTACK[2000];
 typedef slot **T_VARIABLES;
-slot *const NULL_SLOT = new slot();
 
 // Instruction = Code + no more than 1 operand
 struct instruct {
-    instruct_code code;
-    int operand;
+    instruct_code code = NOOP;
+    int operand{};
     int address = -1;
 
     instruct(int _addr, instruct_code _code, int _operand) : address(_addr), code(_code), operand(_operand) {}
 
     instruct(int _addr, instruct_code _code) : address(_addr), code(_code) {}
 
-    instruct() {}
+    instruct() = default;
 };
 
 // Stack frame
 struct frame {
-    T_VARIABLES locals;
+    T_VARIABLES locals{};
     int var_cnt = 0;
-    int return_ip;
-    T_OPSTACK local_operands;
+    int return_ip{};
+    T_OPSTACK local_operands{};
     int op_top = -1;
     frame *caller;
 
-    frame(frame *_caller) : caller(_caller) {}
+    explicit frame(frame *_caller) : caller(_caller) {}
 };
 
 instruct instructs[MAX_INSTRUCTION_NUM]; // Instructions
@@ -267,6 +277,8 @@ private:
     int op_top;
     int ip{};
     bool verbose = false;
+    bool evaluator = false;
+    long long int n_ins = 0;
     T_OPSTACK *operands{};
     int *op_top_ptr{};
 
@@ -368,18 +380,22 @@ public:
         verbose = true;
     }
 
+    void enable_evaluator() {
+        evaluator = true;
+    }
+
     void reset() {
         ip = -1;
         ins_cnt = 0;
         while (op_top > -1) {
-            RELEASE(global_operands[op_top--]);
+            SLOT_DECREF(global_operands[op_top--], "Reset");
         }
         esp = nullptr;
         while (var_cnt--) {
-            RELEASE(globals[var_cnt]);
+            SLOT_DECREF(globals[var_cnt], "Reset");
         }
         while (constant_cnt--) {
-            RELEASE(constants[constant_cnt]);
+            SLOT_DECREF(constants[constant_cnt], "Reset");
         }
         var_cnt = 0;
         constant_cnt = 0;
@@ -399,6 +415,10 @@ public:
             Machine::load_name_code_mapping();
             Machine::load_param_mapping();
         }
+        clock_t start = 0, finish;
+        if (evaluator) {
+            start = clock();
+        }
         full_dispatch:
         {
             operands = (esp == nullptr) ? &global_operands : &(esp->local_operands);
@@ -406,6 +426,7 @@ public:
 
             dispatch:
             {
+                n_ins++;
                 instruct ins = instructs[++ip];
                 if (verbose) {
                     std::cout << "======================================" << std::endl;
@@ -524,8 +545,8 @@ public:
                     }
 
                     case LOAD_NULL: {
-                        OP_PUSH(NULL_SLOT);
-                        SLOT_INCREF(NULL_SLOT, "LOAD_NULL value");
+                        slot* slt = new slot();
+                        OP_PUSH(slt);
                         if (verbose) {
                             std::cout << "NULL value (type: void) was loaded to operand stack." << std::endl;
                         }
@@ -670,7 +691,7 @@ public:
                         slot *operand = OP_POP();
 
                         if (ins.operand == 0 || ins.operand == 1) {
-                            slot *res;
+                            slot *res = nullptr;
                             // NOT
                             if (ins.operand == 0) {
                                 if (operand->type == INT) {
@@ -684,6 +705,10 @@ public:
                                 } else if (operand->type == FLOAT) {
                                     res = new slot(-operand->float_val);
                                 }
+                            }
+
+                            if (res == nullptr) {
+                                panic("Unsupported unary operator");
                             }
 
                             OP_PUSH(res);
@@ -719,7 +744,7 @@ public:
                         slot *right = OP_POP();
                         slot *left = OP_POP();
 
-                        slot *res;
+                        slot *res = nullptr;
                         // +
                         if (ins.operand == 0) {
                             if (left->type == INT && right->type == INT) {
@@ -782,28 +807,28 @@ public:
                             // &
                         else if (ins.operand == 5) {
                             if (left->type == INT && right->type == INT) {
-                                res = new slot(left->int_val & right->int_val);
+                                res = new slot((int_tp) ((unsigned int) left->int_val & (unsigned int) right->int_val));
                             }
                         }
 
                             // |
                         else if (ins.operand == 6) {
                             if (left->type == INT && right->type == INT) {
-                                res = new slot(left->int_val | right->int_val);
+                                res = new slot((int_tp) ((unsigned int) left->int_val | (unsigned int) right->int_val));
                             }
                         }
 
                             // <<
                         else if (ins.operand == 7) {
                             if (left->type == INT && right->type == INT) {
-                                res = new slot(left->int_val << right->int_val);
+                                res = new slot((int_tp) ((unsigned int) left->int_val << (unsigned int) right->int_val));
                             }
                         }
 
                             // >>
                         else if (ins.operand == 8) {
                             if (left->type == INT && right->type == INT) {
-                                res = new slot(left->int_val >> right->int_val);
+                                res = new slot((int_tp) ((unsigned int) left->int_val >> (unsigned int) right->int_val));
                             }
                         }
 
@@ -811,7 +836,7 @@ public:
                             // ^
                         else if (ins.operand == 9) {
                             if (left->type == INT && right->type == INT) {
-                                res = new slot(left->int_val ^ right->int_val);
+                                res = new slot((int_tp) ((unsigned int) left->int_val ^ (unsigned int) right->int_val));
                             }
                         }
 
@@ -893,6 +918,10 @@ public:
                             }
                         }
 
+                        if (res == nullptr) {
+                            panic("Unsupported binary operator");
+                        }
+
                         OP_PUSH(res);
                         if (verbose) {
                             std::cout << "Pop " << left->as_string() << " and " << right->as_string()
@@ -945,13 +974,15 @@ public:
                         DISPATCH;
                     }
                     case BUILD_ARR: {
-                        basic_data_types type;
+                        basic_data_types type = VOID;
                         if (ins.operand == 0) {
                             type = INT;
                         } else if (ins.operand == 1) {
                             type = FLOAT;
                         } else if (ins.operand == 2) {
                             type = CHAR;
+                        } else {
+                            panic("Unexpected type");
                         }
                         int val = OP_POP()->int_val;
                         slot *tmp = new slot(val, type);
@@ -971,6 +1002,9 @@ public:
                         slot *source = OP_POP();
                         slot *target = OP_POP();
                         int subscr = source->int_val;
+                        if (subscr < 0 || subscr >= target->array_size) {
+                            panic("Array index out of bound");
+                        }
                         slot *fresh = OP_PUSH(*(target->array_val + subscr));
                         if (verbose) {
                             std::cout << "Loaded element with index " << subscr << " of the array." << std::endl;
@@ -993,44 +1027,56 @@ public:
                         slot *p_subscr = OP_POP();
                         int subscr = p_subscr->int_val;
                         slot *target = OP_TOP();
-                        switch (target->arr_element_type) {
-                            case INT:
-                                (*(target->array_val + subscr))->int_val = val->int_val;
-                                break;
-                            case FLOAT:
-                                (*(target->array_val + subscr))->float_val = val->float_val;
-                                break;
-                            case CHAR:
-                                (*(target->array_val + subscr))->char_val = val->char_val;
-                                break;
+                        if (subscr < 0 || subscr >= target->array_size) {
+                            panic("Array index out of bound");
                         }
+                        SLOT_DECREF(target->array_val[subscr], "Array element store subscr");
+                        target->array_val[subscr] = val;
                         if (verbose) {
                             std::cout << "Changed element with index " << subscr << " of the array to "
                                       << val->as_string() << "." << std::endl;
                         }
+
+                        if (ins.code != STORE_SUBSCR_INPLACE) {
+                            OP_POP();
+                        }
                         if (ins.code == STORE_SUBSCR_NOPOP) {
                             OP_PUSH(val);
-                        } else if (ins.code == STORE_SUBSCR) {
-                            OP_POP();
                         }
                         SLOT_DECREF(p_subscr, "Poped target subscr");
                         DISPATCH;
+                    }
+                    default: {
+                        panic("Unexpected instruction");
+                        break;
                     }
                 }
             }
         }
         finish:
-        {}
+        {
+            if (evaluator) {
+                finish = clock();
+                double time_delta = (double) (finish - start) / CLOCKS_PER_SEC;
+                std::cout << "<<<<<* Performance evaluator *>>>>>" << std::endl;
+                std::cout << n_ins << " instructions executed in total" << std::endl;
+                std::cout << "Time consumotion(s): " << std::fixed << std::setprecision(8) << time_delta << std::endl;
+                std::cout << "MIPS: " << std::fixed << std::setprecision(8) << (double) n_ins / time_delta * 1e-6 << std::endl;
+            }
+        }
     }
 };
 
 std::unordered_map<std::string, instruct_code> Machine::string_inscode_mapping;
 int Machine::inscode_param_cnt_mapping[200];
 
-void interpret(std::istream &is, bool verbose, bool in_interact) {
+void interpret(std::istream &is, bool verbose, bool evaluate, bool in_interact) {
     Machine machine = Machine();
     if (verbose) {
         machine.enable_verbose();
+    }
+    if (evaluate) {
+        machine.enable_evaluator();
     }
     int addr;
     while (is >> addr) {
@@ -1073,6 +1119,10 @@ void interpret(std::istream &is, bool verbose, bool in_interact) {
                     constants[addr] = new slot((char_tp) tmp);
                     break;
                 }
+
+                default: {
+                    panic("Unexpected type");
+                }
             }
             is >> constants[addr]->ref_cnt;
             continue;
@@ -1093,9 +1143,9 @@ void interpret(std::istream &is, bool verbose, bool in_interact) {
     if (!in_interact) machine.dispatch();
 }
 
-void interact(bool verbose) {
-    interpret(std::cin, verbose, true);
-};
+void interact(bool verbose, bool evaluate) {
+    interpret(std::cin, verbose, evaluate, true);
+}
 
 void assemble(const std::string& raw_file_path, const std::string& out_file_path, std::string password) {
     std::ifstream raw_file(raw_file_path, std::ios::in);
@@ -1123,42 +1173,40 @@ void assemble(const std::string& raw_file_path, const std::string& out_file_path
     password = MAGIC + password;
     int len = password.length();
     std::cout << ":Encrypting bytecode..." << std::endl;
-    for (int i = 0; i < s.length(); i++) s[i] ^= password[i % len];
+    for (int i = 0; i < s.length(); i++) s[i] = (unsigned int) s[i] ^ (unsigned int) password[i % len];
     out_file << s;
 
     raw_file.close();
     out_file.close();
 }
 
-void run(const std::string& input_file_path, bool verbose, std::string password) {
+void run(const std::string& input_file_path, bool verbose, bool evaluate, std::string password) {
     std::ifstream input_file(input_file_path, std::ios::in);
     std::string content((std::istreambuf_iterator<char>(input_file)),
                         (std::istreambuf_iterator<char>()));
     password = MAGIC + password;
     int len = password.length();
-    for (int i = 0; i < content.length(); i++) content[i] ^= password[i % len];
+    for (int i = 0; i < content.length(); i++) content[i] = (unsigned int) content[i] ^ (unsigned int) password[i % len];
     std::stringstream ss(content);
     std::string hd;
     ss >> hd;
-    interpret(ss, verbose, false);
-};
+    interpret(ss, verbose, evaluate, false);
+}
 
-void disassemble(std::string input_file_path, std::string password) {
+void disassemble(const std::string& input_file_path, std::string password) {
     std::ifstream input_file(input_file_path, std::ios::in);
     std::string content((std::istreambuf_iterator<char>(input_file)),
                         (std::istreambuf_iterator<char>()));
     std::string code_name_mapping[200];
-    for (auto x : Machine::string_inscode_mapping) {
+    for (const auto& x : Machine::string_inscode_mapping) {
         code_name_mapping[x.second] = x.first;
     }
+    password = MAGIC + password;
     int len = password.length();
-    if (len) {
-        for (int i = 0; i < content.length(); i++) content[i] ^= password[i % len];
-    }
+    for (int i = 0; i < content.length(); i++) content[i] = ((unsigned int) content[i]) ^ ((unsigned int) password[i % len]);
     std::stringstream ss(content);
     std::string hd;
     ss >> hd;
-    if (hd != "80JF34R9S") return;
     int addr;
     while (ss >> addr) {
         std::cout << addr << " ";
@@ -1168,33 +1216,36 @@ void disassemble(std::string input_file_path, std::string password) {
         ins = instruct_code(ins_tmp);
         std::cout << code_name_mapping[ins] << " ";
         int param_number = Machine::inscode_param_cnt_mapping[ins];
-        while (param_number) {
-            int param;
+        while (param_number--) {
+            std::string param;
             ss >> param;
             std::cout << param << " ";
         }
         std::cout << std::endl;
     }
-};
+}
 
 int main(int argc, char *argv[]) {
     Machine::load_param_mapping();
-    int opt;
     enum run_mode {
         RUN,
         INTERACT,
         DISASSEMBLE,
         ASSEMBLE
     };
-    run_mode rm;
-    char const *optstring = "r:d:a:ivo:p:";
+    run_mode rm = RUN;
+    char const *optstring = "r:d:a:ivo:p:eh";
     std::string input_path;
     std::string output_path;
     std::string password;
     bool verbose = false;
+    bool evaluate = false;
     int o;
     while ((o = getopt(argc, argv, optstring)) != -1) {
         switch (o) {
+            case 'e':
+                evaluate = true;
+                break;
             case 'r':
                 rm = RUN;
                 input_path.assign(optarg);
@@ -1219,15 +1270,25 @@ int main(int argc, char *argv[]) {
             case 'p':
                 password.assign(optarg);
                 break;
+            case 'h':
+            default:
+                std::cout <<
+                 "\n"
+                 "Usage:\n"
+                 "$ svm -r (-e) ./helloworld.slb (-v) (-p password) -- Run program (-v: in verbose mode, -e: performance evaluator)\n"
+                 "$ svm -d ./helloworld.slb (-p password) -- Disassembly\n"
+                 "$ svm -i (-v) (-e) -- Interact Mode (-v: in verbose mode, -e: performance evaluator)\n"
+                 "$ svm -a ./helloworld.txt -o ./helloworld.slb (-p password) -- Assembly input file\n" << std::endl;
+                break;
         }
     }
     switch (rm) {
         case RUN:
-            run(input_path, verbose, password);
+            run(input_path, verbose, evaluate, password);
             break;
         case INTERACT:
             Machine::load_name_code_mapping();
-            interact(verbose);
+            interact(verbose, evaluate);
             break;
         case ASSEMBLE:
             Machine::load_name_code_mapping();
